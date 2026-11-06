@@ -2,6 +2,13 @@ import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
 import test from 'node:test'
 import { allowGuard } from '../lib/gate.js'
+import { MAX_MESSAGE_BYTES, MAX_MESSAGE_QUEUE, checkInbound, composeMessage, deliverMessage } from '../lib/master-messaging.js'
+import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { MASTER_SESSION_ID } from '../lib/master-session.js'
+import { createDraftStore } from '../lib/secretary-nudge.js'
 
 /**
  * `lib/index.js` is the DSH plugin entry, and it imports three packages the host
@@ -15,22 +22,36 @@ const dataUrl = (source) => 'data:text/javascript,' + encodeURIComponent(source)
 const STUBS = {
   '@deepseek-ai/schemastery': `
     function chain() {
-      const node = {}
-      node.default = () => chain()
-      node.volatile = () => chain()
-      node.min = () => chain()
-      node.max = () => chain()
-      node.step = () => chain()
-      node.description = () => chain()
-      node.describe = () => chain()
+      // The shape is recorded rather than enforced: no host package is installed, so the
+      // tests can only read what the plugin declared (default, bounds, volatility).
+      const node = { defaultValue: undefined, minValue: undefined, maxValue: undefined, volatileFlag: false }
+      node.default = (value) => {
+        node.defaultValue = value
+        return node
+      }
+      node.volatile = () => {
+        node.volatileFlag = true
+        return node
+      }
+      node.min = (value) => {
+        node.minValue = value
+        return node
+      }
+      node.max = (value) => {
+        node.maxValue = value
+        return node
+      }
+      node.step = () => node
+      node.description = () => node
+      node.describe = () => node
       return node
     }
     const z = {
       boolean: () => chain(),
       string: () => chain(),
       number: () => chain(),
-      array: () => chain(),
-      object: () => chain(),
+      array: (item) => Object.assign(chain(), { item }),
+      object: (shape) => Object.assign(chain(), { shape }),
     }
     export default z
   `,
@@ -38,7 +59,25 @@ const STUBS = {
     export function defineTool(spec) { return spec }
   `,
   zod: `
-    const z = { object: () => ({ strict: () => ({}) }), enum: () => ({}), boolean: () => ({}) }
+    const chain = () => {
+      const node = {}
+      node.default = () => chain()
+      node.min = () => node
+      node.max = () => node
+      node.int = () => node
+      node.nonnegative = () => node
+      node.strict = () => node
+      node.optional = () => node
+      return node
+    }
+    const z = {
+      object: () => chain(),
+      enum: () => ({}),
+      boolean: () => ({}),
+      string: () => chain(),
+      number: () => chain(),
+      array: () => chain(),
+    }
     export { z }
     export default z
   `,
@@ -103,8 +142,14 @@ function fakeCtx({
   sessions,
   stateOf,
   catalogNames = HOST_TOOLS,
+  memoryEnabled = false,
+  panelEnabled = false,
+  masterEnabled = false,
+  secretaryEnabled = false,
+  secretaryOrchestrators = [],
+  storageDomain,
 } = {}) {
-  const state = { enabled, allowed }
+  const state = { enabled, allowed, memoryEnabled, panelEnabled, masterEnabled, secretaryEnabled, secretaryOrchestrators }
   const projections = []
   const tools = []
   const handlers = new Map()
@@ -112,6 +157,7 @@ function fakeCtx({
   // with the child's parent as carrier, so the retry listener has to be registered global.
   const handlerOptions = new Map()
   const effects = []
+  const sections = []
   const logs = { info: [], warn: [] }
   const emitted = []
   // The live tool catalog the plugin publishes, as a writable volatile reference.
@@ -122,10 +168,32 @@ function fakeCtx({
       catalog = next
     },
   }
+  // The provided services, keyed by service name. `provide` is what the real
+  // ctx exposes; the master panel endpoint is registered through it.
+  const services = new Map()
+  // The paths every optional host service is resolved through in production:
+  // optionalService() tries ctx.get(name) before the direct property.
+  const getCalls = []
   const ctx = {
     sessionProjections: {
-      register: (projection) => projections.push(projection),
+      // A real registration is a thenable that resolves to a handle; the master
+      // panel endpoint awaits exactly that handle and calls stateOf on it.
+      register: (projection) => {
+        projections.push(projection)
+        const handle = { stateOf: (session) => stateOf?.(session) }
+        const ready = Promise.resolve(handle)
+        return Object.assign(() => {}, {
+          then: (onFulfilled, onRejected) => ready.then(onFulfilled, onRejected),
+          catch: (onRejected) => ready.catch(onRejected),
+          finally: (onFinally) => ready.finally(onFinally),
+          stateOf: handle.stateOf,
+        })
+      },
       stateOf,
+    },
+    provide(name, value) {
+      services.set(name, value)
+      return () => services.delete(name)
     },
     tools: {
       register(tool) {
@@ -135,9 +203,20 @@ function fakeCtx({
       // The context-global view the catalog reads: names plus an empty visible map.
       view: () => ({ knownNames: new Set(catalogNames), visible: new Map() }),
     },
+    get(name) {
+      getCalls.push(name)
+      return name in ctx ? ctx[name] : undefined
+    },
     subagents: {},
+    systemPrompt: {
+      section(section) {
+        sections.push(section)
+        return () => {}
+      },
+    },
+    storageDomain,
     agents: agents ?? { get: () => undefined },
-    sessions: sessions ?? { get: () => undefined, flush: async () => true },
+    sessions: sessions ?? { get: () => undefined, list: () => [], flush: async () => true },
     effect(fn, label) {
       const dispose = fn()
       effects.push({ label, dispose })
@@ -165,6 +244,12 @@ function fakeCtx({
     superviseIntervalSeconds: { get: () => 600 },
     superviseMaxNoticesPerChild: { get: () => 3 },
     superviseNotifyOnNoProgress: { get: () => false },
+    masterMemoryEnabled: { get: () => state.memoryEnabled },
+    masterPanelEnabled: { get: () => state.panelEnabled },
+    masterSessionEnabled: { get: () => state.masterEnabled },
+    secretaryEnabled: { get: () => state.secretaryEnabled },
+    secretaryMasterSessionId: { get: () => 'master-1' },
+    secretaryOrchestrators: { get: () => state.secretaryOrchestrators },
     toolCatalog: catalogRef,
   }
   return {
@@ -176,6 +261,10 @@ function fakeCtx({
     handlers,
     handlerOptions,
     effects,
+    sections,
+    storageDomain,
+    services,
+    getCalls,
     logs,
     emitted,
     catalogNames,
@@ -193,6 +282,9 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
   const restricted = []
   const guards = []
   const registered = []
+  // 当前生效的遮罩（安装时加入、disposer 执行时移除）：restricted 是历史，判断"现在被藏
+  // 起来了什么"必须看这一个，否则取消再认领之后历史里的 read 会一直留在数组里。
+  const masked = new Set()
   const agent = {
     id,
     options: { provider: 'p', model: 'm', ...(depth === undefined ? {} : { subagentDepth: depth }) },
@@ -201,7 +293,8 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
       tools: {
         restrict({ deny }) {
           restricted.push(deny[0])
-          return () => {}
+          masked.add(deny[0])
+          return () => masked.delete(deny[0])
         },
         guard(fn) {
           guards.push(fn)
@@ -217,7 +310,7 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
       },
     },
   }
-  return { agent, restricted, guards, registered }
+  return { agent, restricted, guards, registered, masked: () => [...masked] }
 }
 
 /** Start the plugin and hand back its `agent/created` handler. */
@@ -229,9 +322,19 @@ function start(options) {
   return { ...harness, created }
 }
 
+/**
+ * Unload the plugin the way cordis does it (fiber.d.ts): every disposer runs in
+ * reverse registration order, and the unload waits for each one.
+ */
+async function unload(harness) {
+  for (const entry of [...harness.effects].reverse()) {
+    if (typeof entry.dispose === 'function') await entry.dispose()
+  }
+}
+
 test('a child with a persisted delegation depth is never gated', () => {
   // Regression: a cold-resumed child was gated as a main agent, losing every working
-  // tool and keeping only delegate/orchestrate. Its depth lives in the session header.
+  // tool and keeping only the dispatch entry. Its depth lives in the session header.
   for (const { agent, restricted, guards } of [
     fakeAgent({ header: { delegationDepth: 1 } }),
     fakeAgent({ header: {} , depth: 1 }),
@@ -249,7 +352,7 @@ test('a delegated child gets a short role-neutral description, never the main-ag
   const { created } = start()
   const { agent, registered } = fakeAgent({ header: { delegationDepth: 1 } })
   created({ agent, source: 'resume' })
-  assert.deepEqual(registered.map((tool) => tool.name).sort(), ['delegate', 'orchestrate'])
+  assert.deepEqual(registered.map((tool) => tool.name).sort(), ['dispatch'])
   for (const tool of registered) {
     assert.equal(/main[- ]agent/i.test(tool.description), false, tool.name)
     assert.equal(tool.description.includes('Main-agent rule:'), false, tool.name)
@@ -261,9 +364,9 @@ test('a delegated child gets a short role-neutral description, never the main-ag
 
 test('a child a preset hid delegation from gets no shadow that would defeat the filter', () => {
   const { created } = start()
-  const { agent, registered } = fakeAgent({ header: { delegationDepth: 1 }, hidden: ['delegate'] })
+  const { agent, registered } = fakeAgent({ header: { delegationDepth: 1 }, hidden: ['dispatch'] })
   created({ agent, source: 'resume' })
-  assert.deepEqual(registered.map((tool) => tool.name), ['orchestrate'])
+  assert.deepEqual(registered.map((tool) => tool.name), [])
 })
 
 test('a main agent gets the full rule and no scoped shadows', () => {
@@ -271,10 +374,8 @@ test('a main agent gets the full rule and no scoped shadows', () => {
   const { agent, registered } = fakeAgent()
   created({ agent, source: 'create' })
   assert.deepEqual(registered, [], 'the global pair is enough for a main agent')
-  const delegate = tools.find((tool) => tool.name === 'delegate')
-  const orchestrate = tools.find((tool) => tool.name === 'orchestrate')
-  assert.match(delegate.description, /Main-agent rule: the main agent plans only/)
-  assert.match(orchestrate.description, /Main-agent rule: the main agent plans only/)
+  const dispatch = tools.find((tool) => tool.name === 'dispatch')
+  assert.match(dispatch.description, /Main-agent rule: the main agent plans only/)
 })
 
 test('a panel refresh still re-masks main agents and leaves a child shadow in place', () => {
@@ -289,11 +390,11 @@ test('a panel refresh still re-masks main agents and leaves a child shadow in pl
   const { handlers, created, state } = start({ agents: { get: () => undefined, roots } })
   created({ agent: main.agent, source: 'create' })
   created({ agent: child.agent, source: 'startup' })
-  assert.deepEqual(childShadows, ['delegate', 'orchestrate'])
+  assert.deepEqual(childShadows, ['dispatch'])
   state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   handlers.get('loader/volatile-update')()
   assert.equal(main.mask.has('read'), false, 'the main mask follows the panel write')
-  assert.deepEqual(childShadows, ['delegate', 'orchestrate'], 'a refresh must not register anything else')
+  assert.deepEqual(childShadows, ['dispatch'], 'a refresh must not register anything else')
 })
 
 test('a main agent is masked and guarded, and only the shipped whitelist passes', () => {
@@ -310,14 +411,14 @@ test('a main agent is masked and guarded, and only the shipped whitelist passes'
   assert.match(guards[0]({ name: 'subagent' }), /"subagent" is not available to the main agent/)
 })
 
-test('the shipped whitelist is twelve planning tools, and every other name is refused', () => {
-  // The main agent keeps the delegation tools, the session read-only tools and `compress`:
-  // the capabilities that make planning and review possible without touching the repo.
+test('the shipped whitelist is eleven planning tools, and every other name is refused', () => {
+  // The main agent keeps the one delegation entry, the session read-only tools and
+  // `compress`: the capabilities that make planning and review possible without touching
+  // the repo.
   const shipped = mod.DEFAULT_ALLOWED_TOOLS
-  assert.equal(shipped.length, 12)
+  assert.equal(shipped.length, 11)
   for (const name of [
-    'delegate',
-    'orchestrate',
+    'dispatch',
     'send_message',
     'interrupt_agent',
     'todo_write',
@@ -364,7 +465,7 @@ test('the shipped whitelist is twelve planning tools, and every other name is re
   for (const name of ['ops_bash', 'read', 'decompress']) {
     assert.match(guards[0]({ name }), /is not available to the main agent/, name)
   }
-  assert.equal(guards[0]({ name: 'delegate' }), undefined)
+  assert.equal(guards[0]({ name: 'dispatch' }), undefined)
 })
 
 test('a resumed agent with a parentSession but no depth is gated and warns', () => {
@@ -405,23 +506,23 @@ test('the switch being off still installs the guard and stays quiet', () => {
 
 test('a whitelist written in the panel reaches an open conversation, live', () => {
   // The whitelist is read per call, so a panel write lands in a conversation that was
-  // already open: checking `read` lets it through at once, unchecking `delegate` blocks it.
+  // already open: checking `read` lets it through at once, unchecking `dispatch` blocks it.
   const { created, state } = start()
   const { agent, guards } = fakeAgent()
   created({ agent, source: 'create' })
   assert.match(guards[0]({ name: 'read' }), /not available to the main agent/)
-  assert.equal(guards[0]({ name: 'delegate' }), undefined)
+  assert.equal(guards[0]({ name: 'dispatch' }), undefined)
 
   state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   assert.equal(guards[0]({ name: 'read' }), undefined)
 
-  state.allowed = mod.DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'delegate')
-  assert.match(guards[0]({ name: 'delegate' }), /"delegate" is not available to the main agent/)
-  assert.equal(guards[0]({ name: 'orchestrate' }), undefined)
+  state.allowed = mod.DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'dispatch')
+  assert.match(guards[0]({ name: 'dispatch' }), /"dispatch" is not available to the main agent/)
+  assert.equal(guards[0]({ name: 'compress' }), undefined)
 
   // Unchecking every box disables every tool: an empty whitelist is not "use the default".
   state.allowed = []
-  for (const name of ['delegate', 'orchestrate', 'compress', 'read']) {
+  for (const name of ['dispatch', 'send_message', 'compress', 'read']) {
     assert.match(guards[0]({ name }), /is not available to the main agent/, name)
   }
 })
@@ -430,22 +531,20 @@ test('the whitelist clause follows the live config without re-registering', () =
   // The description is a getter, so the same registered tool renders the new list: a
   // settings change reaches the prompt without a restart or a new session.
   const { tools, state } = start()
-  const delegate = tools.find((tool) => tool.name === 'delegate')
-  const orchestrate = tools.find((tool) => tool.name === 'orchestrate')
+  const dispatch = tools.find((tool) => tool.name === 'dispatch')
   const allowedOf = (tool) =>
     /Allowed for the main agent \(whitelist-driven; every other tool is blocked\): ([^.]+)\./.exec(tool.description)?.[1]
-  assert.equal(allowedOf(delegate), mod.DEFAULT_ALLOWED_TOOLS.join(', '))
-  assert.equal(allowedOf(orchestrate), mod.DEFAULT_ALLOWED_TOOLS.join(', '))
+  assert.equal(allowedOf(dispatch), mod.DEFAULT_ALLOWED_TOOLS.join(', '))
 
-  state.allowed = ['delegate', 'orchestrate', 'read']
-  assert.equal(allowedOf(delegate), 'delegate, orchestrate, read')
-  assert.equal(allowedOf(orchestrate), 'delegate, orchestrate, read')
+  state.allowed = ['dispatch', 'read']
+  assert.equal(allowedOf(dispatch), 'dispatch, read')
 
   // The rule has a second sentence for the case where the panel unchecks everything.
   state.allowed = []
-  assert.match(delegate.description, /No tools are currently allowed for the main agent\./)
-  assert.equal(allowedOf(delegate), undefined)
+  assert.match(dispatch.description, /No tools are currently allowed for the main agent\./)
+  assert.equal(allowedOf(dispatch), undefined)
 })
+
 /** Only the members supervision adapters use, with recording friendly defaults. */
 function fakeSupervisionHost({ parents = new Map(), sessions = new Map(), stateOf, flush } = {}) {
   const logs = []
@@ -701,6 +800,7 @@ test('deliver queues exactly one notice with followup, never steer', async () =>
   assert.deepEqual(calls.followup[0].source, {
     kind: mod.SUPERVISE_SOURCE_KIND,
     form: 'notice',
+    summary: '巡检正文',
     senderSessionId: 'child-1',
   })
   assert.equal(calls.flush.length, 1)
@@ -896,7 +996,7 @@ test('the retry prompt goes through the host protocol entry, as a queued turn of
   assert.equal(sender, parent, 'the live parent is the sender the host requires')
   assert.equal(childId, 'child-1')
   assert.deepEqual(content, [{ type: 'text', text: '继续' }])
-  assert.deepEqual(source, { kind: 'orchestrator-retry', form: 'notice' })
+  assert.deepEqual(source, { kind: 'orchestrator-retry', form: 'notice', summary: '继续' })
   assert.equal(delivery, 'queue', 'a retry is a new turn, not a steer into a dead one')
   assert.equal(typeof signal?.aborted, 'boolean')
 })
@@ -926,10 +1026,20 @@ test('the retry notice has its own source kind, so it cannot mask a supervision 
   assert.equal(await supervision.deliverRetry('p', '重试正文', ['child-1']), 'queued')
   assert.equal(queued.length, 1)
   assert.equal(queued[0].content[0].text, '重试正文')
-  assert.deepEqual(queued[0].source, { kind: 'orchestrator-retry', form: 'notice', senderSessionId: 'child-1' })
+  assert.deepEqual(queued[0].source, {
+    kind: 'orchestrator-retry',
+    form: 'notice',
+    summary: '重试正文',
+    senderSessionId: 'child-1',
+  })
   // The supervision notice keeps the kind `hasPendingNotice` looks for.
   assert.equal(await supervision.deliver('p', '巡检正文', ['child-1']), 'queued')
-  assert.deepEqual(queued[1].source, { kind: mod.SUPERVISE_SOURCE_KIND, form: 'notice', senderSessionId: 'child-1' })
+  assert.deepEqual(queued[1].source, {
+    kind: mod.SUPERVISE_SOURCE_KIND,
+    form: 'notice',
+    summary: '巡检正文',
+    senderSessionId: 'child-1',
+  })
 })
 
 // ---- Live tool catalog -----------------------------------------------------------------
@@ -989,3 +1099,855 @@ test('the published catalog includes tools a scope registers for a root agent', 
   })
   assert.deepEqual(harness.catalog(), ['read', 'subagent'])
 })
+
+// ---- Master memory (ticket 01): opt-in domain plus compact index injection ----
+
+/** A domain handle the plugin can open, backed by a Map so writes are observable. */
+function fakeMemoryDomain(seed = []) {
+  const rows = new Map(seed)
+  const opens = []
+  let closes = 0
+  const domain = {
+    name: 'orchestrator_memory',
+    table(name) {
+      return {
+        tableName: name,
+        get: (key) => rows.get(key),
+        entries: () => rows.entries(),
+        keys: () => rows.keys(),
+        get size() {
+          return rows.size
+        },
+        async put(key, value) {
+          rows.set(key, value)
+        },
+        async delete(key) {
+          return rows.delete(key)
+        },
+        async deleteMany(keys) {
+          let removed = 0
+          for (const key of keys) if (rows.delete(key)) removed += 1
+          return removed
+        },
+      }
+    },
+    async close() {
+      closes += 1
+    },
+  }
+  const storageDomain = {
+    opens,
+    async open(spec) {
+      opens.push(spec)
+      return domain
+    },
+  }
+  return { storageDomain, rows, opens, closes: () => closes }
+}
+
+const memoryRecord = (id, text, updatedAt = 1) => ({ id, text, tags: [], createdAt: updatedAt, updatedAt })
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+test('the master memory switch is off by default: no domain opens and no section is injected', async () => {
+  const memory = fakeMemoryDomain()
+  const harness = start({ storageDomain: memory.storageDomain })
+  await settle()
+  assert.equal(memory.opens.length, 0)
+  assert.equal(harness.sections.length, 0)
+
+  // A config that lacks the key at all is the same answer: the feature stays off.
+  delete harness.config.masterMemoryEnabled
+  assert.equal(await mod.attachMasterMemory(harness.ctx, harness.config), undefined)
+  await settle()
+  assert.equal(memory.opens.length, 0)
+  assert.equal(harness.sections.length, 0)
+})
+
+test('the master memory switch opens the domain and injects a labelled live index', async () => {
+  const memory = fakeMemoryDomain([['mem-1', memoryRecord('mem-1', '用户偏好：worker 用简体中文')]])
+  const harness = start({ memoryEnabled: true, storageDomain: memory.storageDomain })
+  await settle()
+
+  assert.equal(memory.opens.length, 1)
+  assert.equal(memory.opens[0].name, MEMORY_DOMAIN_NAME)
+  assert.equal(harness.sections.length, 1)
+  const [section] = harness.sections
+  assert.equal(section.name, MEMORY_INDEX_SECTION)
+  assert.equal(section.order, MEMORY_SECTION_ORDER)
+  const text = section.text()
+  assert.match(text, /AI 记忆/)
+  assert.match(text, /非用户指令/)
+  assert.match(text, /worker 用简体中文/)
+
+  // The callback reads the domain at assembly time, not at registration time.
+  memory.rows.set('mem-2', memoryRecord('mem-2', '新沉淀的事实', 2))
+  assert.match(section.text(), /新沉淀的事实/)
+
+  // Unload closes the domain the plugin opened.
+  const owned = harness.effects.find(({ label }) => label === 'orchestrator: master memory domain')
+  assert.ok(owned, 'the opened domain is owned by an effect')
+  owned.dispose()
+  await settle()
+  assert.equal(memory.closes(), 1)
+})
+
+test('the master status projection is registered host-only and folds a worker row', () => {
+  const { projections } = start()
+  const master = projections.find((projection) => projection.key === 'orchestrator-master')
+  assert.ok(master, 'the master projection must be registered')
+  assert.equal(master.wire, undefined, 'a host-only unit declares no client view')
+  assert.equal(master.stateVersion, 1)
+
+  const init = master.init({ id: 'w-1', origin: 'subagent', delegationDepth: 1 }, 0)
+  assert.deepEqual(init.workers, [{ id: 'w-1', role: 'worker', state: 'Idle', summary: '' }])
+
+  const working = master.apply(init, { type: 'turn/start', data: { turn: 1 } })
+  assert.equal(working.workers[0].state, 'Working')
+
+  // An event the unit does not own keeps the reference, so no downstream work runs.
+  assert.equal(master.apply(working, { type: 'step/start', data: { turn: 1, step: 1 } }), working)
+
+  const done = master.apply(working, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  assert.deepEqual(done.workers[0], { id: 'w-1', role: 'worker', state: 'Completed', summary: '' })
+})
+
+test('the master panel endpoint is provided and folds live sessions behind its switch', async () => {
+  const session = { header: { id: 'w-2' } }
+  const harness = start({
+    panelEnabled: true,
+    sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+    stateOf: (target) => ({
+      workers: [{ id: target.header.id, role: 'worker', state: 'Working', summary: 'panel' }],
+    }),
+  })
+  const service = harness.services.get('orchestratorMaster')
+  assert.ok(service, 'the read-only endpoint service is provided')
+  assert.equal(typeof service.masterState, 'function')
+
+  const on = await service.masterState()
+  assert.equal(on.enabled, true)
+  assert.equal(on.byState.Working, 1)
+  assert.deepEqual(on.workers, [{ id: 'w-2', role: 'worker', state: 'Working', summary: 'panel' }])
+
+  // The switch is read per call: no reload, and no worker data leave the host.
+  harness.state.panelEnabled = false
+  const off = await service.masterState()
+  assert.equal(off.enabled, false)
+  assert.equal(off.byState.Working, 0)
+  assert.deepEqual(off.workers, [])
+})
+
+test('a host without a usable storage domain degrades explicitly and injects nothing', async () => {
+  const missing = start({ memoryEnabled: true })
+  await settle()
+  assert.equal(missing.sections.length, 0, 'no domain, no injected section')
+  assert.match(missing.logs.warn.join('\n'), /storageDomain|storage-domain/)
+
+  const broken = fakeMemoryDomain()
+  broken.storageDomain.open = async () => {
+    throw new Error('backend-not-found')
+  }
+  const failed = start({ memoryEnabled: true, storageDomain: broken.storageDomain })
+  await settle()
+  assert.equal(failed.sections.length, 1, 'the section registration survives, it is empty')
+  assert.equal(failed.sections[0].text(), '')
+  assert.match(failed.logs.warn.join('\n'), /backend-not-found/)
+})
+
+// ---- Persistent master session (ticket 05): opt-in lifecycle ----------------------------
+
+/**
+ * A fake `ctx.agents` registry. The plugin only reads `get`, `resume` and `create`,
+ * and every call is recorded so the discovery order is inspectable.
+ */
+function fakeAgentRegistry({ resume, create } = {}) {
+  const calls = []
+  const live = new Map()
+  const remember = (handle) => {
+    if (handle?.agent !== undefined) live.set(handle.agent.id, handle.agent)
+    return handle
+  }
+  return {
+    calls,
+    get: (id) => live.get(id),
+    async resume(options) {
+      calls.push(['resume', options])
+      return remember(await resume(options))
+    },
+    async create(options) {
+      calls.push(['create', options])
+      return remember(await create(options))
+    },
+  }
+}
+
+const fakeMasterAgent = (id = MASTER_SESSION_ID) => ({ id, session: { id } })
+
+test('the master session switch is off by default: no session is found, created or owned', async () => {
+  const agents = fakeAgentRegistry({
+    resume: async () => {
+      throw new Error('must not be called while the switch is off')
+    },
+    create: async () => {
+      throw new Error('must not be called while the switch is off')
+    },
+  })
+  const sessions = { get: () => undefined, list: () => [], flush: async () => true }
+  const harness = start({ agents, sessions })
+  await settle()
+
+  assert.equal(agents.calls.length, 0)
+  assert.equal(
+    harness.effects.some(({ label }) => label.startsWith('orchestrator: master session')),
+    false,
+    'an off switch owns nothing',
+  )
+})
+
+test('the master session switch resumes the fixed root session and owns a flush-then-dispose cleanup', async () => {
+  const order = []
+  const agent = fakeMasterAgent()
+  const agents = fakeAgentRegistry({
+    resume: async () => ({ agent, dispose: async () => order.push('dispose') }),
+    create: async () => {
+      throw new Error('a found session must not be replaced')
+    },
+  })
+  const sessions = {
+    get: () => undefined,
+    list: () => [],
+    async flush(session) {
+      order.push('flush')
+      assert.equal(session, agent.session)
+      return true
+    },
+  }
+  const harness = start({ masterEnabled: true, agents, sessions })
+  await settle()
+
+  assert.deepEqual(agents.calls.map(([name]) => name), ['resume'])
+  assert.equal(agents.calls[0][1].resumeSessionId, MASTER_SESSION_ID)
+
+  // The found session is checkpointed at start, so its file exists before any turn.
+  assert.deepEqual(order, ['flush'])
+
+  assert.ok(harness.getCalls.includes('agents'), 'the registry is read through ctx.get, the production path')
+  assert.ok(harness.getCalls.includes('sessions'), 'the session service is read through ctx.get too')
+
+  // The two lifecycle effects, in registration order. cordis runs disposers in
+  // reverse, so this is what an unload actually executes.
+  const lifecycle = harness.effects.filter(({ label }) => label.startsWith('orchestrator: master session'))
+  assert.deepEqual(
+    lifecycle.map(({ label }) => label),
+    ['orchestrator: master session shutdown', 'orchestrator: master session'],
+    'the shutdown marker is registered before the session it protects',
+  )
+  for (const entry of [...lifecycle].reverse()) await entry.dispose()
+  assert.deepEqual(order, ['flush', 'flush', 'dispose'], 'the reversed disposers flush before they dispose')
+})
+
+test('unloading the whole plugin flushes the master before any teardown runs', async () => {
+  const order = []
+  const agent = fakeMasterAgent()
+  const agents = fakeAgentRegistry({
+    resume: async () => ({ agent, dispose: async () => order.push('dispose') }),
+    create: async () => {
+      throw new Error('a found session must not be replaced')
+    },
+  })
+  const sessions = {
+    get: () => undefined,
+    list: () => [],
+    async flush() {
+      order.push('flush')
+      return true
+    },
+  }
+  const harness = start({ masterEnabled: true, agents, sessions })
+  await settle()
+  await unload(harness)
+  assert.deepEqual(order, ['flush', 'flush', 'dispose'], 'flush-then-dispose survives a whole-plugin unload')
+})
+
+test('a master that cannot start is reported and never breaks the rest of the plugin', async () => {
+  const agents = fakeAgentRegistry({
+    resume: async () => {
+      throw new Error('session not found')
+    },
+    create: async () => {
+      throw new Error('the persistence backend is read-only')
+    },
+  })
+  const sessions = { get: () => undefined, list: () => [], flush: async () => true }
+  const harness = start({ masterEnabled: true, agents, sessions })
+  await settle()
+
+  assert.equal(
+    harness.effects.some(({ label }) => label === 'orchestrator: master session'),
+    false,
+    'a failed start owns no lifecycle',
+  )
+  assert.ok(
+    harness.tools.some(({ name }) => name === 'dispatch'),
+    'the dispatch entry survives a broken master',
+  )
+  assert.match(harness.logs.warn.join('\n'), /master/)
+})
+
+test('a host without the agent registry degrades with a warning instead of throwing', async () => {
+  const harness = start({ masterEnabled: true, agents: {} })
+  await settle()
+  assert.ok(harness.logs.warn.length > 0)
+  assert.match(harness.logs.warn.join('\n'), /master/i)
+})
+
+// ---- Cross-session messaging (ticket 06): switch read, protocol exported, no tool ------
+
+test('the messaging switch is read live with the module constants as its ceiling', () => {
+  // apply registers nothing for messaging: the ticket asks for the protocol, so the
+  // switch is read wherever a delivery starts, not captured at load time.
+  let enabled = false
+  let policy = 'accept'
+  const config = {
+    masterMessagingEnabled: { get: () => enabled },
+    masterInboundPolicy: { get: () => policy },
+  }
+
+  assert.deepEqual(mod.masterMessagingSettings(config), {
+    enabled: false,
+    policy: 'accept',
+    maxBytes: MAX_MESSAGE_BYTES,
+    maxQueue: MAX_MESSAGE_QUEUE,
+  })
+
+  enabled = true
+  policy = 'hold'
+  assert.deepEqual(mod.masterMessagingSettings(config), {
+    enabled: true,
+    policy: 'hold',
+    maxBytes: MAX_MESSAGE_BYTES,
+    maxQueue: MAX_MESSAGE_QUEUE,
+  })
+})
+
+test('the messaging protocol is exported from the plugin entry and registers no tool', () => {
+  assert.equal(mod.composeMessage, composeMessage)
+  assert.equal(mod.checkInbound, checkInbound)
+  assert.equal(mod.deliverMessage, deliverMessage)
+
+  const harness = start({})
+  const names = harness.tools.map(({ name }) => name)
+  assert.equal(
+    names.some((name) => /messag/i.test(name)),
+    false,
+    'a message entry tool is out of scope for ticket 06 and must not appear meanwhile',
+  )
+})
+
+test('a switch-off host refuses a message without touching any agent', async () => {
+  const settings = mod.masterMessagingSettings({
+    masterMessagingEnabled: { get: () => false },
+    masterInboundPolicy: { get: () => 'accept' },
+  })
+  let looked = 0
+  const result = await deliverMessage(
+    { agents: { get: () => { looked += 1; return undefined } }, sessions: { flush: async () => true }, queue: undefined },
+    { toSessionId: 'worker-1', text: 'x' },
+    { ...settings, loadLlm: async () => ({ createUserMessage: (input) => input }) },
+  )
+  assert.deepEqual(result, { decision: 'refuse', reason: 'disabled' })
+  assert.equal(looked, 0)
+})
+
+// ---- Secretary registry (secretary spec, ticket 01): declaration only -----------------
+
+test('the secretary keys are declared with their defaults and are all volatile', () => {
+  // This ticket adds the storage face of lib/secretary-registry.js: six config keys the
+  // settings card will write. Nothing reads them yet, so what can be pinned is the
+  // declaration itself — the default, the bounds the spec fixes, and the volatile flag
+  // that lets a settings write reach the running plugin without editing the profile file.
+  const { shape } = mod.Config
+  assert.ok(shape, 'Config must expose the keys it declares')
+
+  const defaults = {
+    secretaryMasterSessionId: '',
+    secretaryBeatSeconds: 180,
+    secretaryMaxRunSeconds: 7200,
+    secretaryPromptText: '',
+  }
+  for (const [key, value] of Object.entries(defaults)) {
+    assert.ok(shape[key], `Config must declare ${key}`)
+    assert.deepEqual(shape[key].defaultValue, value, `${key} default`)
+    assert.equal(shape[key].volatileFlag, true, `${key} must be volatile`)
+  }
+
+  assert.deepEqual(shape.secretaryOrchestrators.defaultValue, [])
+  assert.equal(shape.secretaryOrchestrators.volatileFlag, true, 'secretaryOrchestrators must be volatile')
+
+  assert.deepEqual(shape.secretaryNotifyOn.defaultValue, [
+    'state-flip',
+    'step-advance',
+    'blocked',
+    'deliverable',
+    'timeout',
+  ])
+  assert.equal(shape.secretaryNotifyOn.volatileFlag, true, 'secretaryNotifyOn must be volatile')
+
+  // The spec fixes the cadence window: 3 minutes by default, capped at 2 hours.
+  assert.equal(shape.secretaryBeatSeconds.minValue, 10)
+  assert.equal(shape.secretaryBeatSeconds.maxValue, 86400)
+  assert.equal(shape.secretaryMaxRunSeconds.minValue, 60)
+  assert.equal(shape.secretaryMaxRunSeconds.maxValue, 86400)
+})
+
+test('one tracked row stores a session id and three optional fields', () => {
+  const { shape } = mod.Config
+  const fields = shape.secretaryOrchestrators.item.shape
+  assert.ok(fields, 'a stored row must declare its fields')
+  assert.ok(fields.sessionId, 'a row must declare sessionId')
+  assert.equal(fields.workspace?.defaultValue, '')
+  assert.equal(fields.title?.defaultValue, '')
+  assert.equal(fields.trackedAt?.defaultValue, 0)
+})
+
+test('applying with no secretary key at all is still a clean start', () => {
+  // The keys are storage for later tickets, so an older profile has none of them: the
+  // plugin must load and register its ordinary units without a complaint.
+  const harness = start()
+  assert.ok(harness.projections.some(({ key }) => key === 'orchestrator'))
+  assert.ok(harness.tools.some(({ name }) => name === 'dispatch'))
+  assert.equal(harness.logs.warn.length, 0)
+})
+
+// ---- Secretary trigger (secretary spec, ticket 03): opt-in watch + planning report ------
+
+/** 会话日志里的一条 dispatch 工具调用，形状与宿主的 `tool/call` 事件一致。 */
+function dispatchEvent(args, { callId = 'call-1', time = 1000 } = {}) {
+  return { type: 'tool/call', time, data: { turn: 1, step: 1, callId, name: 'dispatch', arguments: JSON.stringify(args) } }
+}
+
+const trackedOrchestrator = { sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 1 }
+const planDir = (dir) => join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
+
+test('the secretary watch switch is off by default and volatile', () => {
+  const { shape } = mod.Config
+  assert.ok(shape.secretaryEnabled, 'Config must declare the watch switch')
+  assert.equal(shape.secretaryEnabled.defaultValue, false, 'a watch nothing registered is the safe default')
+  assert.equal(shape.secretaryEnabled.volatileFlag, true, 'a settings write must reach the running plugin')
+})
+
+test('an off switch registers no secretary effect and subscribes to no session event', () => {
+  const off = start()
+  // 最老的 profile 里这三把键一个都不存在：加载结果必须与「声明了但关着」一模一样，
+  // 这样「关闭时行为与今天完全一致」就不是一句话，而是一次逐项比较。
+  const older = fakeCtx()
+  delete older.config.secretaryEnabled
+  delete older.config.secretaryMasterSessionId
+  delete older.config.secretaryOrchestrators
+  mod.apply(older.ctx, older.config)
+
+  assert.deepEqual(
+    off.effects.map(({ label }) => label),
+    older.effects.map(({ label }) => label),
+    'an off switch adds no effect at all',
+  )
+  assert.deepEqual([...off.handlers.keys()], [...older.handlers.keys()], 'and no extra subscription')
+  assert.deepEqual(
+    off.tools.map(({ name }) => name),
+    older.tools.map(({ name }) => name),
+    'and no extra tool',
+  )
+  assert.equal(
+    off.effects.some(({ label }) => label.startsWith('orchestrator: secretary')),
+    false,
+    'an off switch owns nothing',
+  )
+  assert.equal(off.handlers.has('session/event'), false, 'no session listener may exist while the switch is off')
+  assert.equal(
+    off.tools.some(({ name }) => /secretary/i.test(name)),
+    false,
+    'this ticket adds no tool',
+  )
+})
+
+test('a tracked dispatch writes one planning report, and a repeat dispatch does not rewrite it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-plan-'))
+  try {
+    const harness = start({ secretaryEnabled: true, secretaryOrchestrators: [trackedOrchestrator] })
+    const listener = harness.handlers.get('session/event')
+    assert.equal(typeof listener, 'function', 'the watch subscribes to session/event')
+    assert.ok(
+      harness.effects.some(({ label }) => label === 'orchestrator: secretary watch'),
+      'the listener is owned by an effect, so an unload removes it',
+    )
+
+    const session = { id: 'orch-1', header: { cwd: dir } }
+    await listener(
+      session,
+      dispatchEvent({ description: '修登录', prompt: '让重试可用', verify: 'node --test', doneDefinition: '测试全绿' }),
+    )
+
+    // 票 04 的归档约定：与节拍报告同一套 `<HH-mm>.md`，不再另写 .plan.json。
+    const files = await readdir(planDir(dir))
+    assert.equal(files.length, 1)
+    assert.match(files[0], /^\d{2}-\d{2}\.md$/)
+    const written = await readFile(join(planDir(dir), files[0]), 'utf8')
+    assert.match(written, /^# 秘书规划$/m)
+    assert.match(written, /- 时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+    assert.match(written, /- 会话：orch-1/)
+    assert.match(written, /## 步骤\n\n1\. 修登录 — 让重试可用/)
+    assert.match(written, /## 验收点\n\n- 测试全绿\n- node --test/)
+    assert.match(written, /## 触发依据\n\n- 来源：dispatch/)
+    assert.match(written, /- 调用：call-1/)
+
+    // 同一会话第二次 dispatch：不再起表，第一份文件原样留着。
+    await listener(session, dispatchEvent({ description: '第二份' }, { callId: 'call-2', time: 2000 }))
+    assert.equal(await readFile(join(planDir(dir), files[0]), 'utf8'), written)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an untracked session writes nothing, and registering it takes effect on the next dispatch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-untracked-'))
+  try {
+    const harness = start({ secretaryEnabled: true })
+    const listener = harness.handlers.get('session/event')
+    const session = { id: 'orch-1', header: { cwd: dir } }
+
+    await listener(session, dispatchEvent({ description: '未登记' }))
+    await assert.rejects(readdir(join(dir, '.scratch')), { code: 'ENOENT' })
+
+    // 非 dispatch 的工具调用也不算出发。
+    harness.state.secretaryOrchestrators.push(trackedOrchestrator)
+    await listener(session, { type: 'tool/call', time: 1, data: { callId: 'c', name: 'read', arguments: '{}' } })
+    await assert.rejects(readdir(join(dir, '.scratch')), { code: 'ENOENT' })
+
+    // 登记表是 volatile 的，下一次 dispatch 就用新名单。
+    await listener(session, dispatchEvent({ description: '修登录' }))
+    assert.equal((await readdir(planDir(dir))).length, 1)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// ---- Secretary view endpoint (secretary spec, ticket 06): read-only five-segment payload -----
+
+test('the secretary endpoint is provided only while its switch is on', async () => {
+  // 关闭：一个服务都不注册（master 面板的端点与这把开关无关，仍在）。
+  const off = start()
+  assert.deepEqual([...off.services.keys()], ['orchestratorMaster'])
+  assert.equal(off.services.has('orchestratorSecretary'), false, 'a closed switch registers no secretary service')
+
+  const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }
+  const harness = start({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+    sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+    agents: { get: (id) => (id === 'orch-1' ? { id } : undefined) },
+    stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Working', summary: '在写报告' }] }),
+  })
+  const service = harness.services.get('orchestratorSecretary')
+  assert.ok(service, 'the open switch provides the read-only endpoint')
+  assert.equal(typeof service.secretaryState, 'function')
+
+  const payload = await service.secretaryState()
+  assert.deepEqual(Object.keys(payload), ['enabled', 'registry', 'orchestrators', 'reports', 'drafts', 'policy'])
+  assert.equal(payload.enabled, true)
+  assert.equal(payload.registry.masterSessionId, 'master-1')
+  // No workspace on the ledger row and no session to resolve one from: the row says so instead
+  // of the view silently listing no reports forever.
+  assert.deepEqual(
+    payload.registry.orchestrators,
+    [{ sessionId: 'orch-1', workspace: '', workspaceMissing: true, title: '', trackedAt: 1 }],
+  )
+  // The stored list the settings edits address by index, unnormalized.
+  assert.deepEqual(payload.registry.raw, [{ sessionId: 'orch-1' }])
+  assert.equal(payload.orchestrators.length, 1)
+  assert.equal(payload.orchestrators[0].sessionId, 'orch-1')
+  assert.equal(payload.orchestrators[0].title, '修登录', 'an empty ledger title falls back to the session title')
+  assert.equal(payload.orchestrators[0].live, true)
+  assert.equal(payload.orchestrators[0].state, 'Working')
+  // No beat has started yet, so the row carries the zeroed beat shape; step and
+  // lastError are not part of the contract while they have no data source.
+  assert.deepEqual(payload.orchestrators[0].beats, { count: 0, startedAt: null, capped: false, stoppedReason: null })
+  assert.equal('step' in payload.orchestrators[0], false)
+  assert.equal('lastError' in payload.orchestrators[0], false)
+  assert.deepEqual(payload.reports, [], 'a workspace that was never written lists no report')
+  assert.deepEqual(payload.drafts, [], 'ticket 08 owns the drafts')
+  assert.equal(payload.policy.beatSeconds, 180)
+  assert.equal(payload.policy.maxRunSeconds, 7200)
+  // Only the four fields the endpoint really reads: a report root and a view limit were never
+  // config keys, and showing them in the settings tab was a lie about what can be changed.
+  assert.deepEqual(Object.keys(payload.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
+
+  // 开关是 volatile 的：关掉之后同一个服务返回稳定空结构，不读任何会话。
+  harness.state.secretaryEnabled = false
+  const closed = await service.secretaryState()
+  assert.equal(closed.enabled, false)
+  assert.deepEqual(closed.orchestrators, [])
+  assert.deepEqual(closed.registry.orchestrators, [])
+})
+
+test('a row registered without a workspace reads its reports from the session cwd (why: the history stayed blank forever)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-noworkspace-'))
+  try {
+    await mkdir(planDir(dir), { recursive: true })
+    const reportPath = join(planDir(dir), '05-07.md')
+    await writeFile(reportPath, '# 秘书汇报\n\n- 类型：增量\n')
+    // The settings page registers a session id and nothing else, so the ledger row's workspace is
+    // the empty string. The report is really under that session's header.cwd.
+    const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1', cwd: dir } }
+    const harness = start({
+      secretaryEnabled: true,
+      secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+      sessions: {
+        get: (id) => (id === 'orch-1' ? session : undefined),
+        list: () => [session],
+        flush: async () => true,
+      },
+      stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Working', summary: '在写报告' }] }),
+    })
+    const payload = await harness.services.get('orchestratorSecretary').secretaryState()
+    assert.deepEqual(payload.registry.orchestrators, [
+      { sessionId: 'orch-1', workspace: dir, workspaceMissing: false, title: '', trackedAt: 1 },
+    ])
+    assert.equal(payload.reports.length, 1, 'the archived report is listed once the workspace is known')
+    assert.equal(payload.reports[0].path, reportPath)
+    assert.equal(payload.reports[0].kind, 'delta')
+
+    // A session the host cannot resolve is flagged, not pointed at a guessed directory: the
+    // report root of an empty or borrowed workspace is never read.
+    const other = start({
+      secretaryEnabled: true,
+      secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+      sessions: {
+        get: () => undefined,
+        list: () => [{ id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }],
+        flush: async () => true,
+      },
+    })
+    const flagged = await other.services.get('orchestratorSecretary').secretaryState()
+    assert.deepEqual(flagged.registry.orchestrators[0], {
+      sessionId: 'orch-1',
+      workspace: '',
+      workspaceMissing: true,
+      title: '',
+      trackedAt: 1,
+    })
+    assert.deepEqual(flagged.reports, [], 'nothing is listed for a row with no workspace')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('the mounted secretary drafts a nudge for a Needs input session, dedupes it, and sends only on confirm (why: reads no longer draft)', async () => {
+  const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }
+  const harness = start({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+    sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+    stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Needs input', summary: '等你拍板' }] }),
+  })
+  const service = harness.services.get('orchestratorSecretary')
+  assert.equal(typeof service.confirmDraft, 'function')
+  assert.equal(typeof service.discardDraft, 'function')
+
+  const first = await service.secretaryState()
+  assert.equal(first.drafts.length, 1)
+  assert.equal(first.drafts[0].status, 'pending')
+  assert.equal(first.drafts[0].sessionId, 'orch-1')
+  assert.equal(first.drafts[0].reason, 'needs-input')
+  // The view re-reads on a timer; the same blocker stays one draft.
+  assert.equal((await service.secretaryState()).drafts.length, 1)
+
+  // No live master agent in this fake host, so the send fails loudly and the draft stays pending.
+  const failed = await service.confirmDraft(first.drafts[0].id)
+  assert.equal(failed.delivered, false)
+  assert.match(failed.reason, /no live agent for session master-1/)
+  assert.equal((await service.secretaryState()).drafts[0].status, 'pending')
+
+  const discarded = await service.discardDraft(first.drafts[0].id)
+  assert.equal(discarded.draft.status, 'discarded')
+  const after = await service.secretaryState()
+  assert.equal(after.drafts.find((draft) => draft.id === first.drafts[0].id).status, 'discarded')
+  // Reading no longer drafts: a decided draft stays decided until the next beat tick
+  // drafts the still-existing blocker again (covered in test/secretary-runtime.test.mjs).
+  assert.equal(after.drafts.filter((draft) => draft.status === 'pending').length, 0)
+  const decided = await service.confirmDraft(first.drafts[0].id)
+  assert.equal(decided.reason, 'draft-decided')
+})
+
+test('the view read is a pure snapshot: two reads never draft a nudge (why: the client polls every ten seconds)', async () => {
+  // A store with a trigger ready to fire (Needs input) but no beat and no mount
+  // initialization: the read function must not create the draft itself.
+  const stateOf = () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Needs input', summary: '等你拍板' }] })
+  const harness = fakeCtx({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '修登录', trackedAt: 1 }],
+    sessions: {
+      get: () => undefined,
+      list: () => [{ id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }],
+      flush: async () => true,
+    },
+    stateOf,
+  })
+  const drafts = createDraftStore()
+  const read = mod.createSecretaryViewRead({
+    ctx: harness.ctx,
+    config: harness.config,
+    registration: Promise.resolve({ stateOf }),
+    drafts,
+  })
+
+  const first = await read()
+  const second = await read()
+  assert.deepEqual(first.drafts, [])
+  assert.deepEqual(second.drafts, [])
+  assert.equal(drafts.list().length, 0, 'the read path must not write into the draft store')
+  assert.equal(first.orchestrators[0].state, 'Needs input', 'and it still reports the state it read')
+})
+
+test('the secretary endpoint lists the archived reports of a registered workspace', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-view-'))
+  try {
+    const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1', cwd: dir } }
+    const harness = start({
+      secretaryEnabled: true,
+      secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: dir, title: '', trackedAt: 1 }],
+      sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+      stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Completed', summary: '做完了' }] }),
+    })
+    const service = harness.services.get('orchestratorSecretary')
+    assert.deepEqual((await service.secretaryState()).reports, [], 'no archive yet is an empty list, not an error')
+
+    // 票 03 的 watch 写规划首报；端点从票 04 的归档目录把它读回来。
+    const listener = harness.handlers.get('session/event')
+    await listener(session, dispatchEvent({ description: '修登录', prompt: '让重试可用' }))
+
+    const payload = await service.secretaryState()
+    assert.equal(payload.reports.length, 1)
+    assert.equal(payload.reports[0].sessionId, 'orch-1')
+    assert.equal(payload.reports[0].kind, 'plan')
+    assert.match(payload.reports[0].path, /\.scratch[\\/]master-secretary[\\/]reports[\\/]orch-1[\\/]\d{2}-\d{2}\.md$/)
+    // Ticket 08: the report's diff is the structured shape (here all three groups empty).
+    assert.deepEqual(payload.reports[0].changes, { completed: [], blocked: [], flipped: [] })
+    assert.equal(payload.reports[0].error, null)
+    assert.ok(payload.reports[0].bytes > 0)
+    assert.deepEqual(payload.orchestrators[0].lastReport, {
+      path: payload.reports[0].path,
+      at: payload.reports[0].at,
+      kind: 'plan',
+    })
+    assert.equal(payload.orchestrators[0].live, false, 'no live agent means not live, not an error')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 调度指挥（草图 B）：authority 认领与默认闸门的互换。默认配置（开关关闭、指定为空）下
+// 这些分支一条都不走，所以上面既有的 gate 断言一条都不用改。
+// ---------------------------------------------------------------------------
+
+/** 被指定为 Master 的根 agent：fakeCtx 的 secretaryMasterSessionId 恒为 master-1。 */
+function masterAgent(options = {}) {
+  return fakeAgent({ id: 'master-1', ...options })
+}
+
+test('with the secretary switch off the master session gets the default gate, exactly as today', () => {
+  const { created, logs, handlers } = start()
+  const { agent, restricted, guards } = masterAgent()
+  created({ agent, source: 'create' })
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.equal(guards.length, 1)
+  assert.match(guards[0]({ name: 'read' }), /is not available to the main agent/)
+  assert.equal(logs.info.some((line) => line.includes('dispatch-command')), false)
+  // A settings write while the switch is off must not claim anything either.
+  handlers.get('loader/volatile-update')()
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+})
+
+test('an unset master id designates nobody, even with the secretary switch on', () => {
+  const harness = start({ secretaryEnabled: true })
+  harness.config.secretaryMasterSessionId = { get: () => '' }
+  const { agent, restricted, guards } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.equal(guards.length, 1)
+  assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
+})
+
+test('a session that is not the master keeps the default gate while the switch is on', () => {
+  const harness = start({ secretaryEnabled: true })
+  const { agent, restricted, guards } = fakeAgent({ id: 'someone-else' })
+  harness.created({ agent, source: 'create' })
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.equal(guards.length, 1)
+  assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
+})
+
+test('the designated master is handed to the authority: no default gate, reads stay open', () => {
+  const harness = start({ secretaryEnabled: true })
+  const { agent, restricted, guards } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  // The default list is gone: the mask is now "catalog minus the allow list".
+  assert.equal(restricted.includes('read'), false, 'a read must stay reachable for the master')
+  assert.equal(restricted.includes('edit'), true, 'a writer is still hidden')
+  assert.equal(restricted.includes('write'), true)
+  assert.equal(guards.length, 1, 'exactly one guard is installed for the master')
+  assert.match(harness.logs.info.join('\n'), /dispatch-command authority installed/)
+  assert.equal(guards[0]({ name: 'read', arguments: {} }), undefined)
+  assert.match(guards[0]({ name: 'edit', arguments: {} }), /not available to the dispatch-command agent/)
+})
+
+test('cancelling the switch or re-designating the master reinstates the default gate', () => {
+  const agent = masterAgent()
+  const harness = start({
+    secretaryEnabled: true,
+    agents: { get: () => undefined, roots: () => [agent.agent] },
+  })
+  harness.created({ agent: agent.agent, source: 'create' })
+  assert.equal(agent.masked().includes('read'), false, 'the authority mask leaves reads open')
+
+  // 开关关闭 = 取消调度指挥；交还时必须把默认闸门装回去，不能让它裸奔。
+  harness.state.secretaryEnabled = false
+  harness.handlers.get('loader/volatile-update')()
+  assert.ok(agent.masked().includes('read'), 'the default gate is back once the switch is off')
+
+  // 再打开是新的认领；换个指定则把旧 master 交还，同一条交还路径。
+  harness.state.secretaryEnabled = true
+  harness.handlers.get('loader/volatile-update')()
+  assert.equal(agent.masked().includes('read'), false, 'the authority claims it again')
+  harness.config.secretaryMasterSessionId = { get: () => 'someone-else' }
+  harness.handlers.get('loader/volatile-update')()
+  assert.ok(agent.masked().includes('read'), 're-designating the master returns the default gate')
+})
+
+test('a disposed master is released without a fresh default gate on a dead agent', () => {
+  const harness = start({ secretaryEnabled: true })
+  const { agent, restricted } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  const before = restricted.length
+  harness.handlers.get('agent/disposed')({ agent })
+  assert.equal(restricted.length, before, 'a disposed agent must not be gated again')
+})
+
+test('the secretary payload carries the authority refusals as policy.violations', async () => {
+  const harness = start({ secretaryEnabled: true })
+  const service = harness.services.get('orchestratorSecretary')
+  const clean = await service.secretaryState()
+  assert.equal('violations' in clean.policy, false, 'no record, no extra key: the payload is what it was')
+  assert.deepEqual(Object.keys(clean.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
+
+  const { agent, guards } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  assert.match(guards[0]({ name: 'pwsh', arguments: {} }), /not available to the dispatch-command agent/)
+
+  const payload = await service.secretaryState()
+  assert.equal(payload.policy.violations.length, 1)
+  assert.deepEqual(Object.keys(payload.policy.violations[0]).sort(), ['action', 'agentId', 'at', 'reason'])
+  assert.equal(payload.policy.violations[0].action, 'pwsh')
+  assert.equal(payload.policy.violations[0].agentId, 'master-1')
+})
+

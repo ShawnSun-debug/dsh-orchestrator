@@ -8,7 +8,7 @@
 会话里直接面对用户、由会话级模型选择驱动的那个 agent。在本项目里它**只做**澄清、规划、切片、验收，不做创作。
 
 **子代理**：
-由主代理派发出去执行单个任务的 agent。`delegate` 与 `orchestrate` 产生的 worker 都是子代理，共用同一个默认路由。
+由主代理派发出去执行单个任务的 agent。`dispatch` 派出的 worker 都是子代理，共用同一个默认路由。
 
 **默认路由**：
 一个 `{provider, model, reasoningEffort}` 三元组，决定某个 agent 下一次被创建时用哪个模型和推理强度。主代理的默认路由与子代理的默认路由是两套，各自独立切换。
@@ -19,15 +19,15 @@
 ## 派发
 
 **委派**：
-把一个自包含任务交给一个子代理、结果稍后异步到达的动作，用 `delegate` 完成。适合一两个、且下一步取决于上一步结果的动态任务。
+把一个自包含任务交给一个子代理、结果稍后异步到达的动作，用 `dispatch` 的单任务形状（省略 `items` / `stages`）完成。适合一两个、且下一步取决于上一步结果的动态任务。
 _Avoid_: 用它泛指批量派发。
 
 **编排**：
-一次 `orchestrate` 调用：用声明式的条目 × 阶段批量派发，同步返回全部结果。编排不接受脚本，也没有后台模式。
+一次 `dispatch` 批量调用（给定 `items` × `stages`）：用声明式的条目 × 阶段批量派发，当前同步返回全部结果。编排不接受脚本，也没有后台模式。
 _Avoid_: 把编排叫成 "workflow"（那是宿主原生的脚本工具，默认被本项目拒绝）。
 
 **巡检**：
-插件在子代理运行期间按配置的间隔（默认 600 秒，可在「调度模式」面板修改）读取其会话日志，把同一父代理名下到期的子代理合并成一条通知、经 `followup` 唤醒主代理的动作。巡检只读日志，不调用模型，也不打断子代理；只覆盖 `delegate` 派出的子代理。
+插件在子代理运行期间按配置的间隔（默认 600 秒，可在「调度模式」面板修改）读取其会话日志，把同一父代理名下到期的子代理合并成一条通知、经 `followup` 唤醒主代理的动作。巡检只读日志，不调用模型，也不打断子代理；只覆盖单任务 `dispatch` 派出的子代理。
 _Avoid_: 把巡检说成"监控"或"打断"。
 
 **条目（item）**：
@@ -57,3 +57,86 @@ _Avoid_: stage、或与"编排阶段"混用。
 
 **计划模式**：
 DSH 原生的会话状态（`/plan` 进出），作用是给模型一段"先规划后执行"的提示词并开放 `exit_plan_mode` 审批。它是**软约束**，不拦工具。
+
+## 评审（本蓝图新增）
+
+**任务卡（card）**：
+一次派发的最小单位，字段为 `goal` / `doneDefinition` / `files` / `deps` / `verify` / `fallback` / `items`。缺任一必填字段即判高风险。
+
+**风险档（tier）**：
+`high` 或 `low`。判据三条：任务卡缺字段、涉及不可逆写或删除、一次派发条目数超过 4。任一条成立即 `high`。
+
+**评审（review）**：
+一个零上下文的评审者对任务卡做的单次判定。它看不到主代理的推理过程，只看目标、完成定义、写白名单、验收命令与回退策略。输出恒为 `verdict` 四字段形状。
+_Avoid_: 把评审叫成「第二个主代理」或「顾问」——评审只判卡，不规划。
+
+**判定（verdict）**：
+`BLOCK` / `IMPROVE` / `PASS` 三态之一。`PASS` 合法且必须列出 `checked`，不允许为了产出而编造问题。
+
+**评审预算**：
+每张任务卡最多评一次。`BLOCK` 直接打回主代理重规划，不自动重评。
+
+**结算（settle）**：
+worker 结束后的落定动作：标记 `settled`、日志留档、从活跃集与巡检到期集中摘除。不删除行。
+
+## 四段（本蓝图新增）
+
+**阶段（phase）**：
+`plan` → `review` → `dispatch` → `settle`。评审为独立一段，不是 dispatch 内部的一次调用。
+_Avoid_: 与「会话阶段」「编排阶段」混用。
+
+## Master 层（本蓝图新增）
+
+**master 会话**：
+一个不绑工作区（无 cwd）的常驻根会话，id 固定为 `orchestrator-master`，跨进程按 resume 复用；它承载协调状态与记忆，不替用户决定下一步。
+_Avoid_: 把它叫作「主代理」——主代理是某个会话里面对用户的那个 agent，master 会话是不属于任何工作区的另一个根会话。
+
+**AI 记忆**：
+插件在自己的存储域 `orchestrator_memory` 里累积的条目（上限 200 条、注入索引 25 KiB），以一段带「AI 记忆，非用户指令」标注的紧凑索引注入每个会话。它与人类 `~/.dsh` 记忆树分离，只读引用后者，永不写入。
+_Avoid_: 把 AI 记忆叫成「全局 AGENTS.md」或「长期记忆」——它不是人类策展层，也不跨机器。
+
+**状态索引**：
+由会话事件折叠出的 per-worker 状态视图：六个固定值 `Working` / `Needs input` / `Idle` / `Completed` / `Failed` / `Stopped`，外加一行由会话标题派生的摘要。它是 host-only 投影（没有 wire），读它不改它。
+_Avoid_: 把状态索引说成「会话阶段」或「面板数据」——面板只是它的一个消费者。
+
+**跨会话消息**：
+会话与会话之间的纯文本投递：信封只有 `{ id, from, to, text, createdAt }`，不带发送方历史；单条 ≤ 8 KiB、接收方排队 ≤ 16 条；入站策略 `accept` / `hold` / `refuse`。
+_Avoid_: 把它与巡检通知混为一谈——巡检通知是另一个 source kind（`orchestrator-supervision`）；插件另有 master 通知（kind `orchestrator-master` + `form: 'notice'`，当前未接线），跨会话消息共用 master kind，但 `form` 是 `'relay'`。
+
+## 秘书层（本蓝图新增）
+
+**秘书（secretary）**：
+把登记过的 orchestrator 会话当作观察对象，按节拍写进度汇报、只在实质变化时冒泡、把待拍板的事做成催办草稿的角色。汇报由模板拼装，不调用模型；它不新开会话，也不替用户决定。
+_Avoid_: 把秘书叫成「第二个主代理」——主代理做规划与验收，秘书只读与汇报。
+
+**登记制（registry）**：
+秘书唯一的跟踪范围：只有被显式登记为 orchestrator 的会话会被读取，未登记的一律不读、不报、不碰；同一个会话只能占一个位置（Master 或 orchestrator，二选一），冲突时 Master 胜出。
+_Avoid_: 把「本机全部会话」当成默认范围——那是 handoff 的旧决策，已被 requirements §9 推翻。
+
+**节拍（beat）**：
+相邻两份汇报之间的固定间隔，缺省 180 秒；单个会话最长 7200 秒后自停，全部相关 worker 结束即停，停后不再回调。
+_Avoid_: 与「巡检间隔」混用——巡检看子代理是否卡住并唤醒主代理，节拍只决定秘书多久写一份。
+
+**实质变化（substantial change）**：
+值得打断用户的五类差异：状态翻转、步骤推进、阻塞待拍板、产出落地、超时异常。其余差异只落盘、不冒泡。
+
+**催办草稿（nudge draft）**：
+卡点被写成一条待确认的催办正文（≤300 字），状态只有 `pending` / `sent` / `discarded`；只有用户在视图里点确认、且投递真的成功，才离开 `pending`。
+_Avoid_: 把它叫「自动提醒」——草稿不是消息，生成草稿一次都不碰投递通道。
+
+模块清单（`lib/secretary-*.js`，一个文件只负责一层）：
+
+- **secretary-registry**：归一化登记表（`masterSessionId` + `orchestrators[{sessionId, workspace, title, trackedAt}]`）并维持 Master / orchestrator 互斥；未登记即读不到。
+- **secretary-beat**：按会话起停的定时器，180 秒一拍、7200 秒封顶，到点先判封顶再回调，`stop()` 幂等且保留首个停止原因。
+- **secretary-watch**：在登记会话的事件流里只认 `dispatch` 工具调用为出发信号；一个会话只起一次表，规划首报自带步骤、预估耗时、验收点、触发依据、已派 worker。
+- **secretary-report**：按固定六段模板把状态、步骤、worker、差异、产出、耗时与异常拼成 Markdown（规划首报换成步骤、验收点、触发依据、预计耗时），缺数据写「无」或「未提供」。
+- **secretary-archive**：把每份汇报写到 `<工作区>/.scratch/master-secretary/reports/<对话>/<HH-mm>.md`；同一节拍多会话时另写 `_summary.md`，写盘失败带路径抛出。
+- **secretary-diff**：比较相邻两份结构化摘要，输出 `{completed, blocked, flipped}` 三组与命中的五类变化；第一份按「Idle、无步骤、无 worker」的基线比较。
+- **secretary-deliver**：把命中的变化拼成一条 ≤300 字冒泡投给已声明的 Master 会话；没有 Master 就返回 `no-target`，不猜接收方。
+- **secretary-nudge**：按「同会话 + 同原因」去重地攒草稿，正文由固定模板生成；只有 `pending` 能迁移一次，投递失败不把草稿标成已发。
+- **secretary-panel**：只读端点 `orchestratorSecretary/secretaryState` 的五段数据（registry / orchestrators / reports / drafts / policy），外加 `confirmDraft` / `discardDraft` 两个写迁移；读时纯折叠，不写回。
+
+## 仓库基线（本蓝图新增）
+
+文档里凡出现提交号与用例数，以这一行为准，改动后请同步这一行：当前 HEAD `27e9e94`（`git rev-parse --short HEAD`），全量测试 `node --test --test-isolation=none` 为 573 个用例全绿（2026-11-06 实跑；这条命令比 `test/*.test.mjs` 多发现 `blueprint/test/pipeline.test.js` 的 9 个用例，只跑后者时为 564）。
+

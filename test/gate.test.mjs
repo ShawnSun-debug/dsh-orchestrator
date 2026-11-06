@@ -36,7 +36,7 @@ const CATALOG = [...ALLOWED, ...HOST_TOOLS]
 
 /** The one home for the refusal text; a copy here is what keeps the wording honest. */
 const refusal = (tool) =>
-  `orchestrator: "${tool}" is not available to the main agent. The main agent only plans; hand every action to a worker with the delegate or orchestrate tools.`
+  `orchestrator: "${tool}" is not available to the main agent. The main agent only plans; hand every action to a worker with the dispatch tool.`
 
 /**
  * A stand-in agent: only `globals` may be restricted, as DSH allows only global tools, and
@@ -454,4 +454,51 @@ test('a forked root keeps the gate: parentSession without a depth is not a child
   assert.equal(isDelegatedChild(forked), false)
   const forkedWithoutDepth = { options: {}, session: { header: { parentSession: 'root-session' } } }
   assert.equal(isDelegatedChild(forkedWithoutDepth), false)
+})
+
+// ---- the two facts the gate can fail silently on ---------------------------------------
+
+/**
+ * A whitelist gate fails without an error: hand `installGate` the wrong argument name and
+ * `allowed()` reads empty, which hides every tool but the transport and logs nothing. These
+ * two assertions pin the exact end state, so that regression shows up as a red test instead
+ * of a main agent that mysteriously has no tools.
+ */
+test('an empty whitelist hides and refuses every host tool but the run_code transport', () => {
+  const host = ['dispatch', 'edit', 'write', 'read', 'subagent', 'run_code']
+  const { agent, restricted, getGuard } = fakeAgent({ globals: ['dispatch', 'edit', 'write', 'read'], scope: ['subagent'] })
+  const gate = installGate({ agent, allowed: [], catalog: host, enabled: () => true })
+
+  // Every global name is hidden; `subagent` is scope-local, so only the guard reaches it.
+  assert.deepEqual(gate.applied.sort(), ['dispatch', 'edit', 'read', 'write'])
+  assert.deepEqual(restricted.sort(), ['dispatch', 'edit', 'read', 'write'])
+  assert.equal(gate.applied.includes('run_code'), false, 'the transport is never restricted')
+  assert.equal(gate.allowed.length, 0)
+
+  const guard = getGuard()
+  for (const name of ['dispatch', 'edit', 'write', 'read', 'subagent']) {
+    assert.equal(guard({ name }), refusal(name), name)
+  }
+  // The transport stays reachable, but only for a program that does not escape the gate.
+  assert.equal(guard({ name: 'run_code', arguments: { code: 'return 1' } }), undefined)
+  assert.match(
+    guard({ name: 'run_code', arguments: { code: 'return 1', sandbox_permissions: 'danger-full-access' } }),
+    /sandbox escalation is not available to the main agent/,
+  )
+})
+
+test('a whitelist holding dispatch lets dispatch through and refuses edit and write', () => {
+  const host = ['dispatch', 'edit', 'write', 'read', 'run_code']
+  const { agent, restricted, getGuard } = fakeAgent({ globals: ['dispatch', 'edit', 'write', 'read'] })
+  const gate = installGate({ agent, allowed: ['dispatch'], catalog: host, enabled: () => true })
+
+  assert.deepEqual(gate.allowed, ['dispatch'])
+  assert.deepEqual(gate.applied.sort(), ['edit', 'read', 'write'])
+  assert.deepEqual(restricted.sort(), ['edit', 'read', 'write'])
+
+  const guard = getGuard()
+  assert.equal(guard({ name: 'dispatch' }), undefined, 'the one whitelisted entry stays callable')
+  assert.equal(guard({ name: 'edit' }), refusal('edit'))
+  assert.equal(guard({ name: 'write' }), refusal('write'))
+  assert.equal(guard({ name: 'read' }), refusal('read'))
 })
